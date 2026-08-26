@@ -60,6 +60,14 @@ ALL_INDIAN_STATES = [
 ]
 
 
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "close",
+}
+
+
 def fetch_ogd_saturation(
     api_key: str,
     resource_id: str = DEFAULT_OGD_RESOURCE_ID,
@@ -68,54 +76,98 @@ def fetch_ogd_saturation(
     limit: int = 100,
     offset: int = 0,
     fetch_all: bool = False,
-    batch_size: int = 100,
+    batch_size: int = 250,
     timeout: int = 60,
-    max_retries: int = 3,
+    max_retries: int = 5,
+    delay: float = 0.4,
+    out_path: Path | None = None,
+    resume: bool = True,
 ) -> pd.DataFrame:
     """
     Fetch district saturation/enrolment data from data.gov.in (OGD India API).
-    Handles state/district filters, pagination, retries, and returns a pandas DataFrame.
+    Streams batches directly to disk in append mode, automatically resumes from last
+    saved offset if interrupted, and handles HTTP 429 rate limiting with progressive backoff.
     """
     url = f"{OGD_BASE_URL}/{resource_id}"
     records: list[dict[str, Any]] = []
     current_offset = offset
     page_size = min(limit, batch_size) if not fetch_all else batch_size
 
-    state_info = f" for state='{state}'" if state else " (all states)"
-    print(f"[info] Querying data.gov.in (resource: {resource_id}){state_info} with batch_size={page_size}...")
+    # Automatic resume check if output file exists
+    if out_path and out_path.exists() and resume and offset == 0:
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                existing_lines = sum(1 for _ in f)
+            if existing_lines > 1:
+                current_offset = existing_lines - 1
+                print(f"[resume] Found existing file at {out_path} with {current_offset} rows.", flush=True)
+                print(f"[resume] Resuming download starting from offset {current_offset}...", flush=True)
+        except Exception as e:
+            print(f"[warning] Could not determine resume offset from {out_path}: {e}", file=sys.stderr, flush=True)
 
+    state_info = f" for state='{state}'" if state else " (all states)"
+    print(f"[info] Querying data.gov.in (resource: {resource_id}){state_info} with batch_size={page_size}...", flush=True)
+
+    total_fetched = 0
     while True:
+        cur_limit = page_size if (fetch_all or max_retries) else min(page_size, limit - total_fetched)
+        if not fetch_all and total_fetched >= limit:
+            break
+
         params: dict[str, Any] = {
             "api-key": api_key,
             "format": "json",
             "offset": current_offset,
-            "limit": page_size,
+            "limit": cur_limit,
         }
         if state:
             params["filters[state]"] = state
         if district:
             params["filters[district]"] = district
 
-        # Retry loop for resilience against data.gov.in intermittent timeouts
+        # Robust retry loop handling timeouts, 429 rate limits, and 502/504 gateway errors
         resp = None
         for attempt in range(1, max_retries + 1):
             try:
-                resp = requests.get(url, params=params, timeout=timeout)
+                resp = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=timeout)
+                if resp.status_code == 429:
+                    wait_time = max(6 * attempt, 10)
+                    print(
+                        f"[warning] HTTP 429 Rate Limit at offset {current_offset} (attempt {attempt}/{max_retries}). "
+                        f"Cooling down for {wait_time}s before retrying...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(wait_time)
+                    continue
+                elif resp.status_code in (502, 503, 504):
+                    wait_time = 3 * attempt
+                    print(
+                        f"[warning] HTTP {resp.status_code} Gateway error at offset {current_offset} (attempt {attempt}/{max_retries}). "
+                        f"Retrying in {wait_time}s...",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(wait_time)
+                    continue
+
                 resp.raise_for_status()
                 break
             except (requests.Timeout, requests.ConnectionError) as req_err:
                 if attempt < max_retries:
-                    wait_time = attempt * 2
+                    wait_time = attempt * 3
                     print(
-                        f"[warning] Request timed out at offset {current_offset} (attempt {attempt}/{max_retries}). "
+                        f"[warning] Network timeout/error at offset {current_offset} (attempt {attempt}/{max_retries}). "
                         f"Retrying in {wait_time}s...",
                         file=sys.stderr,
+                        flush=True,
                     )
                     time.sleep(wait_time)
                 else:
                     raise req_err
 
-        if resp is None:
+        if resp is None or resp.status_code != 200:
+            print(f"[warning] Stopping fetch at offset {current_offset} due to unsuccessful response.", file=sys.stderr, flush=True)
             break
 
         data = resp.json()
@@ -130,9 +182,23 @@ def fetch_ogd_saturation(
             batch_records = data
 
         if not batch_records:
+            print(f"[info] No more records returned at offset {current_offset}. Reached end of partition.", flush=True)
             break
 
+        # Convert batch to DataFrame and normalize columns
+        batch_df = pd.DataFrame(batch_records)
+        batch_df.columns = [
+            str(c).strip().lower().replace(" ", "_").replace("-", "_") for c in batch_df.columns
+        ]
+
+        # Stream directly to disk in append mode so progress is never lost
+        if out_path:
+            write_header = not out_path.exists() or out_path.stat().st_size == 0
+            batch_df.to_csv(out_path, mode="a", index=False, header=write_header)
+
         records.extend(batch_records)
+        total_fetched += len(batch_records)
+        current_offset += len(batch_records)
 
         total_available = data.get("total", 0)
         try:
@@ -140,32 +206,26 @@ def fetch_ogd_saturation(
         except (ValueError, TypeError):
             total_available = 0
 
-        current_offset += len(batch_records)
         total_str = f"/{total_available}" if total_available else ""
-        print(f"[progress] Fetched {len(records)}{total_str} records (offset: {current_offset})...")
+        print(f"[progress] Offset {current_offset:6d} | Batch {len(batch_records):3d} recs (Total state fetched: {total_fetched}{total_str}) [SAVED TO DISK]", flush=True)
 
         # Stop if we reached requested limit or fetched all available records
-        if not fetch_all and len(records) >= limit:
-            records = records[:limit]
+        if not fetch_all and total_fetched >= limit:
             break
 
         if total_available and current_offset >= total_available:
             break
 
-        if len(batch_records) < page_size:
+        if len(batch_records) < cur_limit:
             break
 
-        # Slight pause to avoid rate limiting
-        time.sleep(0.1)
+        # Courteous pacing to avoid hitting rate limits
+        if delay > 0:
+            time.sleep(delay)
 
-    df = pd.DataFrame(records)
-
-    # Normalize column names to standard lowercase with underscores
-    df.columns = [
-        str(c).strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns
-    ]
-
-    return df
+    if out_path and out_path.exists():
+        return pd.read_csv(out_path)
+    return pd.DataFrame(records)
 
 
 def fetch_uidai_direct(
@@ -483,6 +543,17 @@ def main():
         help="Number of records to fetch per page request (default: 100)",
     )
     ogd_group.add_argument(
+        "--delay",
+        type=float,
+        default=0.4,
+        help="Inter-request delay in seconds to avoid HTTP 429 rate limit (default: 0.4)",
+    )
+    ogd_group.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Do not auto-resume from existing CSV file; restart fetching from offset 0",
+    )
+    ogd_group.add_argument(
         "--all",
         dest="fetch_all",
         action="store_true",
@@ -559,6 +630,14 @@ def main():
         try:
             frames = []
             for st_name in states_to_fetch:
+                # If downloading a single state, write directly to out_path
+                # If downloading multiple states, write to separate state partitions
+                if len(states_to_fetch) == 1:
+                    state_out_path = out_path
+                else:
+                    state_slug = st_name.lower().replace(" ", "_")
+                    state_out_path = out_path.parent / f"uidai_saturation_{state_slug}.csv"
+
                 state_df = fetch_ogd_saturation(
                     api_key=api_key,
                     resource_id=args.resource_id,
@@ -569,12 +648,19 @@ def main():
                     fetch_all=args.fetch_all,
                     batch_size=args.batch_size,
                     timeout=args.timeout,
+                    delay=args.delay,
+                    out_path=state_out_path,
+                    resume=not args.no_resume,
                 )
                 if not state_df.empty:
                     frames.append(state_df)
 
-            if frames:
+            if len(states_to_fetch) > 1 and frames:
                 df = pd.concat(frames, ignore_index=True)
+                df.to_csv(out_path, index=False)
+                print(f"[success] Combined {len(df)} total rows across {len(states_to_fetch)} states into {out_path}")
+            elif out_path.exists():
+                df = pd.read_csv(out_path)
             else:
                 df = pd.DataFrame()
         except requests.ConnectionError as e:
