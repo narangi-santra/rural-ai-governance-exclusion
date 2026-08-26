@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Train a district-level exclusion risk model.
 

@@ -94,8 +94,10 @@ pip install -r requirements.txt
 Run the pipeline in order:
 
 ```bash
-# 1. Fetch UIDAI district saturation data
-python src/data_collection/fetch_uidai_saturation.py
+# 1. Fetch UIDAI district saturation data from data.gov.in (or with --mock for offline)
+python src/data_collection/fetch_uidai_saturation.py --api-key <YOUR_DATA_GOV_IN_API_KEY>
+# Or offline / testing:
+# python src/data_collection/fetch_uidai_saturation.py --mock
 
 # 2. Place Census, TRAI, Saubhagya files in data/external/ (see data_sources.md)
 
