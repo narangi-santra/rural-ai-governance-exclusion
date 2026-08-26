@@ -14,9 +14,13 @@ explicit about that framing limitation in your write-up.
 """
 
 from pathlib import Path
-
 import pandas as pd
-from fairlearn.metrics import MetricFrame, demographic_parity_difference
+
+try:
+    from fairlearn.metrics import MetricFrame, demographic_parity_difference
+    HAS_FAIRLEARN = True
+except ImportError:
+    HAS_FAIRLEARN = False
 
 ROOT = Path(__file__).resolve().parents[2]
 SHAP_OUT = ROOT / "data" / "processed" / "shap_values.csv"
@@ -59,33 +63,41 @@ def audit():
         else:
             df["group"] = (df[dim] >= median).map({True: "high_exposure", False: "low_exposure"})
 
-        mf = MetricFrame(
-            metrics={"mean_predicted_risk": lambda yt, yp: yp.mean()},
-            y_true=df["high_risk"],
-            y_pred=df["predicted_risk"],
-            sensitive_features=df["group"],
-        )
+        if HAS_FAIRLEARN:
+            mf = MetricFrame(
+                metrics={"mean_predicted_risk": lambda yt, yp: yp.mean()},
+                y_true=df["high_risk"],
+                y_pred=df["predicted_risk"],
+                sensitive_features=df["group"],
+            )
 
-        dp_diff = demographic_parity_difference(
-            y_true=df["high_risk"],
-            y_pred=df["high_risk"],  # using the binarized flag itself
-            sensitive_features=df["group"],
-        )
+            dp_diff = demographic_parity_difference(
+                y_true=df["high_risk"],
+                y_pred=df["high_risk"],
+                sensitive_features=df["group"],
+            )
+            high_mean = mf.by_group.loc["high_exposure", "mean_predicted_risk"] if "high_exposure" in mf.by_group.index else None
+            low_mean = mf.by_group.loc["low_exposure", "mean_predicted_risk"] if "low_exposure" in mf.by_group.index else None
+            print(f"\n--- {dim} ---")
+            print(mf.by_group)
+        else:
+            # Native pandas demographic parity difference calculation
+            group_risk = df.groupby("group")["high_risk"].mean()
+            group_pred = df.groupby("group")["predicted_risk"].mean()
+            dp_diff = abs(group_risk.get("high_exposure", 0) - group_risk.get("low_exposure", 0))
+            high_mean = group_pred.get("high_exposure", None)
+            low_mean = group_pred.get("low_exposure", None)
+            print(f"\n--- {dim} ---")
+            print(group_pred.rename("mean_predicted_risk"))
 
-        print(f"\n--- {dim} ---")
-        print(mf.by_group)
         print(f"Demographic parity difference (high-risk flag rate): {dp_diff:.4f}")
 
         results.append(
             {
                 "dimension": dim,
-                "demographic_parity_difference": dp_diff,
-                "high_exposure_mean_risk": mf.by_group.loc["high_exposure", "mean_predicted_risk"]
-                if "high_exposure" in mf.by_group.index
-                else None,
-                "low_exposure_mean_risk": mf.by_group.loc["low_exposure", "mean_predicted_risk"]
-                if "low_exposure" in mf.by_group.index
-                else None,
+                "demographic_parity_difference": round(float(dp_diff), 4),
+                "high_exposure_mean_risk": round(float(high_mean), 4) if high_mean is not None else None,
+                "low_exposure_mean_risk": round(float(low_mean), 4) if low_mean is not None else None,
             }
         )
 
