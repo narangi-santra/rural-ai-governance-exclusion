@@ -93,15 +93,36 @@ def fetch_ogd_saturation(
     current_offset = offset
     page_size = min(limit, batch_size) if not fetch_all else batch_size
 
-    # Automatic resume check if output file exists
+    # Automatic state-aware resume check if output file exists
     if out_path and out_path.exists() and resume and offset == 0:
         try:
             with open(out_path, "r", encoding="utf-8") as f:
-                existing_lines = sum(1 for _ in f)
-            if existing_lines > 1:
-                current_offset = existing_lines - 1
-                print(f"[resume] Found existing file at {out_path} with {current_offset} rows.", flush=True)
-                print(f"[resume] Resuming download starting from offset {current_offset}...", flush=True)
+                header_line = f.readline()
+                header = [c.strip().lower() for c in header_line.split(",")]
+
+            if "state" in header and state:
+                state_idx = header.index("state")
+                state_count = 0
+                with open(out_path, "r", encoding="utf-8") as f:
+                    next(f)  # skip header
+                    for line in f:
+                        cols = [c.strip().strip('"') for c in line.split(",")]
+                        if len(cols) > state_idx and cols[state_idx].lower() == state.lower():
+                            state_count += 1
+                if state_count > 0:
+                    current_offset = state_count
+                    print(f"[resume] Found {state_count} existing records for state='{state}' in {out_path.name}.", flush=True)
+                    print(f"[resume] Resuming download for '{state}' starting from offset {current_offset}...", flush=True)
+                else:
+                    current_offset = 0
+                    print(f"[info] No existing records found for state='{state}' in {out_path.name}. Starting fresh from offset 0.", flush=True)
+            else:
+                with open(out_path, "r", encoding="utf-8") as f:
+                    existing_lines = sum(1 for _ in f)
+                if existing_lines > 1:
+                    current_offset = existing_lines - 1
+                    print(f"[resume] Found existing file at {out_path.name} with {current_offset} rows.", flush=True)
+                    print(f"[resume] Resuming download starting from offset {current_offset}...", flush=True)
         except Exception as e:
             print(f"[warning] Could not determine resume offset from {out_path}: {e}", file=sys.stderr, flush=True)
 
@@ -628,17 +649,14 @@ def main():
             f"[info] Fetching saturation data from data.gov.in (resource: {args.resource_id})..."
         )
         try:
-            frames = []
-            for st_name in states_to_fetch:
-                # If downloading a single state, write directly to out_path
-                # If downloading multiple states, write to separate state partitions
-                if len(states_to_fetch) == 1:
-                    state_out_path = out_path
-                else:
-                    state_slug = st_name.lower().replace(" ", "_")
-                    state_out_path = out_path.parent / f"uidai_saturation_{state_slug}.csv"
+            partitions_dir = out_path.parent / "ogd_partitions"
+            partitions_dir.mkdir(parents=True, exist_ok=True)
 
-                state_df = fetch_ogd_saturation(
+            for st_name in states_to_fetch:
+                state_slug = st_name.lower().replace(" ", "_")
+                state_out_path = partitions_dir / f"uidai_saturation_{state_slug}.csv"
+
+                fetch_ogd_saturation(
                     api_key=api_key,
                     resource_id=args.resource_id,
                     state=st_name,
@@ -652,16 +670,25 @@ def main():
                     out_path=state_out_path,
                     resume=not args.no_resume,
                 )
-                if not state_df.empty:
-                    frames.append(state_df)
 
-            if len(states_to_fetch) > 1 and frames:
-                df = pd.concat(frames, ignore_index=True)
-                df.to_csv(out_path, index=False)
-                print(f"[success] Combined {len(df)} total rows across {len(states_to_fetch)} states into {out_path}")
+            # Recompile all state partitions in ogd_partitions/ into master CSV
+            all_partition_files = sorted(list(partitions_dir.glob("uidai_saturation_*.csv")))
+            if all_partition_files:
+                combined_dfs = []
+                for p_file in all_partition_files:
+                    if p_file.stat().st_size > 50:
+                        try:
+                            combined_dfs.append(pd.read_csv(p_file))
+                        except Exception:
+                            pass
+                if combined_dfs:
+                    df = pd.concat(combined_dfs, ignore_index=True)
+                    df.to_csv(out_path, index=False)
+                    print(f"\n[success] Compiled master dataset ({len(df)} total rows across {len(combined_dfs)} state partitions) at {out_path}", flush=True)
             elif out_path.exists():
                 df = pd.read_csv(out_path)
             else:
+                df = pd.DataFrame()
                 df = pd.DataFrame()
         except requests.ConnectionError as e:
             print(
